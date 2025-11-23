@@ -8,9 +8,20 @@ import dotenv from "dotenv";
 import { google } from "googleapis";
 import admin from "firebase-admin";
 import axios from "axios";
+const KEYFILEPATH = './service-account.json'; // 👈 Yeh aapka downloaded service account file ka naam
+const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
+
+const auth = new google.auth.GoogleAuth({
+  keyFile: KEYFILEPATH,
+  scopes: SCOPES,
+});
+
+const drive = google.drive({ version: 'v3', auth });
 
 dotenv.config();
 
+const fs = require("fs");
+const { google } = require("googleapis");
 const PORT = process.env.PORT || 3000;
 const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || "";
 const CLEANUP_HOURS = Number(process.env.CLEANUP_HOURS || 24);
@@ -154,6 +165,29 @@ app.post("/friend", async (req, res) => {
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "friend_failed" });
+  }
+});
+
+app.post('/upload', async (req, res) => {
+  try {
+    const filePath = req.body.filePath; // Mobile frontend se file path milega
+
+    const response = await drive.files.create({
+      requestBody: {
+        name: `upload_${Date.now()}`, 
+        mimeType: 'image/jpeg', // 👈 Change if needed
+      },
+      media: {
+        mimeType: 'image/jpeg',
+        body: fs.createReadStream(filePath),
+      },
+    });
+
+    res.json({ success: true, fileId: response.data.id });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
