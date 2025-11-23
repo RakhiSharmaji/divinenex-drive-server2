@@ -21,7 +21,7 @@ const drive = google.drive({ version: 'v3', auth });
 dotenv.config();
 
 const fs = require("fs");
-const { google } = require("googleapis");
+
 const PORT = process.env.PORT || 3000;
 const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || "";
 const CLEANUP_HOURS = Number(process.env.CLEANUP_HOURS || 24);
