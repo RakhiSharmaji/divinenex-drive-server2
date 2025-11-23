@@ -11,7 +11,10 @@ import axios from "axios";
 const KEYFILEPATH = './service-account.json'; // 👈 Yeh aapka downloaded service account file ka naam
 const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
 
+// Initialize Google Drive client (use same service account)
 const auth = new google.auth.GoogleAuth({
+  credentials: serviceAccount,
+  scopes: ["https://www.googleapis.com/auth/drive"]
   keyFile: KEYFILEPATH,
   scopes: SCOPES,
 });
@@ -59,11 +62,7 @@ admin.initializeApp({
 });
 const db = admin.firestore();
 
-// Initialize Google Drive client (use same service account)
-const auth = new google.auth.GoogleAuth({
-  credentials: serviceAccount,
-  scopes: ["https://www.googleapis.com/auth/drive"]
-});
+
 const drive = google.drive({ version: "v3", auth });
 
 const app = express();
