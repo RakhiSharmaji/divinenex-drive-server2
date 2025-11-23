@@ -1,122 +1,219 @@
+// server.js - DivineNex (final)
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
-import { initializeApp } from "firebase/app";
-import { getFirestore, doc, setDoc, getDoc, collection, getDocs, query, where } from "firebase/firestore";
-import { google } from "googleapis";
 import multer from "multer";
 import dotenv from "dotenv";
-import fs from "fs";
+import { google } from "googleapis";
+import admin from "firebase-admin";
 import axios from "axios";
 
 dotenv.config();
 
+const PORT = process.env.PORT || 3000;
+const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || "";
+const CLEANUP_HOURS = Number(process.env.CLEANUP_HOURS || 24);
+if (!process.env.SERVICE_ACCOUNT_JSON) {
+  console.error("SERVICE_ACCOUNT_JSON not provided. Please set as env var in Render/Host.");
+  process.exit(1);
+}
+if (!DRIVE_FOLDER_ID) {
+  console.error("DRIVE_FOLDER_ID not set. Exiting.");
+  process.exit(1);
+}
+
+// Parse service account JSON from env (it can be raw JSON or base64)
+let saJsonRaw = process.env.SERVICE_ACCOUNT_JSON.trim();
+try {
+  // if base64-ish, try decode
+  if (!saJsonRaw.startsWith("{") && /^[A-Za-z0-9+/=\s]+$/.test(saJsonRaw) && saJsonRaw.length > 200) {
+    saJsonRaw = Buffer.from(saJsonRaw, "base64").toString("utf8");
+  }
+} catch (e) {
+  // proceed
+}
+let serviceAccount;
+try {
+  serviceAccount = JSON.parse(saJsonRaw);
+} catch (e) {
+  console.error("Failed to parse SERVICE_ACCOUNT_JSON:", e.message || e);
+  process.exit(1);
+}
+
+// Initialize Firebase Admin (Firestore + optional Storage)
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  storageBucket: process.env.FIREBASE_STORAGE_BUCKET || undefined
+});
+const db = admin.firestore();
+
+// Initialize Google Drive client (use same service account)
+const auth = new google.auth.GoogleAuth({
+  credentials: serviceAccount,
+  scopes: ["https://www.googleapis.com/auth/drive"]
+});
+const drive = google.drive({ version: "v3", auth });
+
 const app = express();
 app.use(cors());
 app.use(helmet());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// Rate limiter
-const limiter = rateLimit({ windowMs: 1000 * 60, max: 100 });
-app.use(limiter);
+// rate limiter
+app.use(rateLimit({ windowMs: 60 * 1000, max: 120 }));
 
-// Firebase setup
-const firebaseConfig = {
-  apiKey: process.env.FIREBASE_API_KEY,
-  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.FIREBASE_PROJECT_ID,
-  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.FIREBASE_APP_ID
-};
-const appFirebase = initializeApp(firebaseConfig);
-const db = getFirestore(appFirebase);
-
-// Google Drive setup
-const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
-const auth = new google.auth.GoogleAuth({
-  credentials: serviceAccount,
-  scopes: ["https://www.googleapis.com/auth/drive.file"]
-});
-const drive = google.drive({ version: "v3", auth });
-const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID;
-const CLEANUP_HOURS = parseInt(process.env.CLEANUP_HOURS || "24");
-
-// Multer setup for uploads
+// multer (memory)
 const storage = multer.memoryStorage();
-const upload = multer({ storage });
+const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB
 
-// Routes
+// HEALTH
+app.get("/health", (req, res) => res.json({ ok: true, now: Date.now() }));
 
-// Health check
-app.get("/", (req, res) => res.send("DivineNex Server Running OK"));
-
-// Guest Profile Create/Check
+// create/update guest profile
 app.post("/guest", async (req, res) => {
-  const { name, email, phone } = req.body;
-  if (!name || !email || !phone) return res.status(400).send("Missing fields");
-  const guestId = email.replace(/[^a-zA-Z0-9]/g, "_");
-  const docRef = doc(db, "guests", guestId);
-  await setDoc(docRef, { name, email, phone, guestId }, { merge: true });
-  res.json({ guestId });
-});
-
-// Upload Post / Article
-app.post("/upload", upload.single("file"), async (req, res) => {
-  const { guestId, title, description } = req.body;
-  if (!guestId || !title) return res.status(400).send("Missing guestId or title");
-
-  let fileUrl = null;
-  if (req.file) {
-    const fileMetadata = { name: req.file.originalname, parents: [DRIVE_FOLDER_ID] };
-    const media = { mimeType: req.file.mimetype, body: Buffer.from(req.file.buffer) };
-    const response = await drive.files.create({ requestBody: fileMetadata, media: media, fields: "id" });
-    fileUrl = `https://drive.google.com/uc?id=${response.data.id}`;
+  try {
+    const { name, email, phone } = req.body || {};
+    if (!name || !email || !phone) return res.status(400).json({ error: "Missing name/email/phone" });
+    const guestId = email.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
+    await db.collection("guests").doc(guestId).set({ name, email, phone, guestId, updatedAt: Date.now() }, { merge: true });
+    return res.json({ success: true, guestId });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "server_error", detail: e.message });
   }
-
-  const postDoc = doc(db, "posts", `${guestId}_${Date.now()}`);
-  await setDoc(postDoc, { guestId, title, description, fileUrl, createdAt: Date.now() });
-  res.json({ success: true, fileUrl });
 });
 
-// List Posts (latest first)
-app.get("/posts", async (req, res) => {
-  const postsCol = collection(db, "posts");
-  const postsSnapshot = await getDocs(postsCol);
-  const posts = [];
-  postsSnapshot.forEach(doc => posts.push(doc.data()));
-  posts.sort((a, b) => b.createdAt - a.createdAt);
-  res.json(posts);
-});
+// upload post (text + optional single file)
+app.post("/upload", upload.single("file"), async (req, res) => {
+  try {
+    const { guestId, title, text } = req.body || {};
+    if (!guestId || !title) return res.status(400).json({ error: "guestId & title required" });
+    // enforce 500 words limit
+    if (text && text.split(/\s+/).length > 500) return res.status(400).json({ error: "text_too_long" });
 
-// Auto cleanup old posts
-const cleanupPosts = async () => {
-  const postsCol = collection(db, "posts");
-  const snapshot = await getDocs(postsCol);
-  const now = Date.now();
-  snapshot.forEach(async (docSnap) => {
-    const post = docSnap.data();
-    if (now - post.createdAt > CLEANUP_HOURS * 3600 * 1000) {
-      if (post.fileUrl) {
-        const fileId = post.fileUrl.split("id=")[1];
-        await drive.files.delete({ fileId }).catch(() => {});
-      }
-      await doc(db, "posts", docSnap.id).delete().catch(() => {});
+    let fileMeta = null;
+    if (req.file) {
+      const filename = `${Date.now()}_${req.file.originalname}`.replace(/\s+/g, "_").slice(0, 200);
+      const mediaStream = Buffer.from(req.file.buffer);
+      const resp = await drive.files.create({
+        requestBody: { name: filename, parents: [DRIVE_FOLDER_ID] },
+        media: { mimeType: req.file.mimetype, body: mediaStream },
+        fields: "id, name"
+      });
+      const fileId = resp.data.id;
+      // set public permission (anyone with link can view)
+      await drive.permissions.create({ fileId, requestBody: { role: "reader", type: "anyone" } }).catch(() => {});
+      fileMeta = { id: fileId, url: `https://drive.google.com/uc?id=${fileId}`, name: resp.data.name };
     }
-  });
-};
-setInterval(cleanupPosts, 60 * 60 * 1000); // hourly check
 
-// Live news (GDELT example)
+    const docRef = db.collection("posts").doc(); // auto id
+    const payload = {
+      guestId,
+      title,
+      text: text || "",
+      file: fileMeta,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + CLEANUP_HOURS * 3600 * 1000
+    };
+    await docRef.set(payload);
+    // optional: add to user's own list
+    await db.collection("guests").doc(guestId).set({ lastPostAt: Date.now() }, { merge: true });
+
+    // broadcast via a lightweight placeholder (if you later add socket.io)
+    // For now just respond
+    return res.json({ success: true, id: docRef.id, payload });
+  } catch (e) {
+    console.error("upload error:", e);
+    return res.status(500).json({ error: "upload_failed", detail: String(e.message) });
+  }
+});
+
+// list posts (with simple pagination)
+app.get("/posts", async (req, res) => {
+  try {
+    const qSnap = await db.collection("posts").orderBy("createdAt", "desc").limit(100).get();
+    const items = [];
+    qSnap.forEach(d => items.push({ id: d.id, ...d.data() }));
+    return res.json({ posts: items });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "read_failed" });
+  }
+});
+
+// add friend
+app.post("/friend", async (req, res) => {
+  try {
+    const { guestId, friendId } = req.body || {};
+    if (!guestId || !friendId) return res.status(400).json({ error: "missing" });
+    const ref = db.collection("guests").doc(guestId);
+    await ref.set({ friends: admin.firestore.FieldValue.arrayUnion(friendId) }, { merge: true });
+    return res.json({ success: true });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "friend_failed" });
+  }
+});
+
+// people search
+app.get("/people", async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    const coll = db.collection("guests");
+    if (!q) {
+      const snap = await coll.limit(100).get();
+      const out = []; snap.forEach(d => out.push(d.data())); return res.json({ people: out });
+    }
+    // simple search: name contains (not highly efficient but works)
+    const snap = await coll.get();
+    const out = [];
+    snap.forEach(d => {
+      const data = d.data();
+      if ((data.name || "").toLowerCase().includes(q.toLowerCase())) out.push(data);
+    });
+    return res.json({ people: out.slice(0, 200) });
+  } catch (e) {
+    console.error(e); return res.status(500).json({ error: "search_failed" });
+  }
+});
+
+// cleanup job: delete expired posts & their drive files
+async function cleanupExpiredPostsOnce() {
+  try {
+    const now = Date.now();
+    const snap = await db.collection("posts").where("expiresAt", "<=", now).get();
+    const deletes = [];
+    snap.forEach(docSnap => {
+      const p = docSnap.data();
+      if (p.file && p.file.id) {
+        deletes.push(drive.files.delete({ fileId: p.file.id }).catch(err => console.warn("drive delete failed", err?.message)));
+      }
+      deletes.push(db.collection("posts").doc(docSnap.id).delete().catch(() => {}));
+    });
+    await Promise.all(deletes);
+    console.log("cleanup done, removed:", deletes.length);
+  } catch (e) {
+    console.error("cleanup error", e);
+  }
+}
+// run cleanup hourly
+setInterval(cleanupExpiredPostsOnce, 60 * 60 * 1000);
+// initial delayed run after start
+setTimeout(cleanupExpiredPostsOnce, 2 * 60 * 1000);
+
+// GDELT simple proxy (example)
 app.get("/news", async (req, res) => {
   try {
-    const response = await axios.get("https://api.gdeltproject.org/api/v2/doc/doc?query=India&mode=ArtList&format=json");
-    res.json(response.data.articles || []);
-  } catch (err) { res.status(500).send(err.toString()); }
+    const q = req.query.q || "India";
+    const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(q)}&mode=ArtList&format=json`;
+    const r = await axios.get(url, { timeout: 10000 });
+    if (r.data && r.data.articles) return res.json({ articles: r.data.articles });
+    return res.json({ articles: [] });
+  } catch (e) {
+    console.error("news err", e?.message || e); return res.status(500).json({ error: "news_failed" });
+  }
 });
 
-// Server start
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`DivineNex server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`DivineNex server listening on ${PORT}`));
