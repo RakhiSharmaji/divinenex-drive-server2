@@ -1,4 +1,4 @@
-// server.js – DivineNex Official Backend (Google Drive + Firebase Working)
+// server.js — DivineNex (Stable Release)
 
 import express from "express";
 import cors from "cors";
@@ -13,188 +13,227 @@ import fs from "fs";
 
 dotenv.config();
 
-// Mandatory env checks
-if (!process.env.SERVICE_ACCOUNT_JSON) {
+// =============================
+// CHECK ENV VARIABLES
+// =============================
+const PORT = process.env.PORT || 3000;
+const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID;
+const SERVICE_JSON = process.env.SERVICE_ACCOUNT_JSON;
+const CLEANUP_HOURS = Number(process.env.CLEANUP_HOURS || 24);
+
+if (!SERVICE_JSON) {
   console.error("❌ SERVICE_ACCOUNT_JSON missing!");
   process.exit(1);
 }
-if (!process.env.DRIVE_FOLDER_ID) {
+if (!DRIVE_FOLDER_ID) {
   console.error("❌ DRIVE_FOLDER_ID missing!");
   process.exit(1);
 }
 
-// Parse Firebase key
-let sa = process.env.SERVICE_ACCOUNT_JSON.trim();
+// =============================
+// PARSE SERVICE ACCOUNT
+// =============================
+let jsonRaw = SERVICE_JSON.trim();
 try {
-  if (!sa.startsWith("{") && /^[A-Za-z0-9+/=]+$/.test(sa)) {
-    sa = Buffer.from(sa, "base64").toString("utf8");
+  if (!jsonRaw.startsWith("{")) {
+    jsonRaw = Buffer.from(jsonRaw, "base64").toString("utf8");
   }
-} catch {}
-const serviceAccount = JSON.parse(sa);
+} catch (_) {}
+let serviceAccount;
+try {
+  serviceAccount = JSON.parse(jsonRaw);
+} catch (e) {
+  console.error("❌ Invalid SERVICE_ACCOUNT_JSON:", e.message);
+  process.exit(1);
+}
 
-// Initialize Firebase
+// =============================
+// INITIALIZE FIREBASE
+// =============================
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 const db = admin.firestore();
 
-// Setup Google Drive Auth
+// =============================
+// INITIALIZE GOOGLE DRIVE
+// =============================
 const auth = new google.auth.GoogleAuth({
   credentials: serviceAccount,
-  scopes: ["https://www.googleapis.com/auth/drive.file"],
+  scopes: ["https://www.googleapis.com/auth/drive"],
 });
 const drive = google.drive({ version: "v3", auth });
 
-const PORT = process.env.PORT || 3000;
-const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID;
-const CLEANUP_HOURS = Number(process.env.CLEANUP_HOURS || 24);
-
+// =============================
+// EXPRESS APP
+// =============================
 const app = express();
 app.use(cors());
+app.options("*", cors());
 app.use(helmet());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-app.use(rateLimit({ windowMs: 60000, max: 100 }));
+// =============================
+// RATE LIMIT
+// =============================
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  max: 200,
+}));
 
-// Multer for file uploads
-const upload = multer({ storage: multer.memoryStorage() });
-
-// Default home
-app.get("/", (req, res) => {
-  res.json({ divineNex: "Backend is Live!", time: Date.now() });
+// =============================
+// MULTER - MEMORY STORAGE
+// =============================
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 }
 });
 
-// Guest Signup / Update
+// =============================
+// ROOT & TEST ENDPOINT
+// =============================
+app.get("/", (_, res) => res.json({ ok: true, msg: "Backend is live!" }));
+app.get("/test", (_, res) => res.json({ test: "success", time: Date.now() }));
+
+// =============================
+// CREATE / UPDATE GUEST
+// =============================
 app.post("/guest", async (req, res) => {
   try {
     const { name, email, phone } = req.body;
-    if (!name || !email || !phone)
-      return res.status(400).json({ error: "missing_fields" });
+    if (!name || !email) return res.status(400).json({ error: "missing_fields" });
 
-    const guestId = email.replace(/[^a-z0-9]/gi, "_").toLowerCase();
-    await db.collection("guests").doc(guestId).set(
-      {
-        name,
-        email,
-        phone,
-        guestId,
-        updatedAt: Date.now(),
-      },
-      { merge: true }
-    );
+    const gid = email.replace(/[^a-zA-Z0-9]/g, "_").toLowerCase();
+    await db.collection("guests").doc(gid).set({
+      name, email, phone,
+      updatedAt: Date.now(),
+    }, { merge: true });
 
-    res.json({ success: true, guestId });
+    return res.json({ success: true, guestId: gid });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "guest_failed" });
   }
 });
 
-// Upload Post + File
+// =============================
+// UPLOAD POST (TEXT + OPTIONAL FILE)
+// =============================
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     const { guestId, title, text } = req.body;
-    if (!guestId || !title)
-      return res.status(400).json({ error: "guestId & title required" });
+    if (!guestId || !title) return res.status(400).json({ error: "required_fields" });
 
-    let file = null;
+    let fileMeta = null;
+
     if (req.file) {
-      const resp = await drive.files.create({
-        requestBody: {
-          name: `${Date.now()}_${req.file.originalname}`.replace(/\s+/g, "_"),
-          parents: [DRIVE_FOLDER_ID],
-        },
-        media: { mimeType: req.file.mimetype, body: req.file.buffer },
+      const filename = `${Date.now()}_${req.file.originalname}`.replace(/\s+/g, "_");
+      const media = Buffer.from(req.file.buffer);
+
+      const uploadRes = await drive.files.create({
+        requestBody: { name: filename, parents: [DRIVE_FOLDER_ID] },
+        media: { mimeType: req.file.mimetype, body: media },
         fields: "id,name",
       });
 
-      await drive.permissions.create({
-        fileId: resp.data.id,
-        requestBody: { role: "reader", type: "anyone" },
-      });
+      const fileId = uploadRes.data.id;
 
-      file = {
-        id: resp.data.id,
-        url: `https://drive.google.com/uc?id=${resp.data.id}`,
-        name: resp.data.name,
+      // Make public
+      await drive.permissions.create({
+        fileId, requestBody: { role: "reader", type: "anyone" }
+      }).catch(() => {});
+
+      fileMeta = {
+        id: fileId,
+        url: `https://drive.google.com/uc?id=${fileId}`,
+        name: uploadRes.data.name,
       };
     }
 
-    const post = {
-      guestId,
-      title,
+    const ref = db.collection("posts").doc();
+    await ref.set({
+      guestId, title,
       text: text || "",
-      file,
+      file: fileMeta,
       createdAt: Date.now(),
       expiresAt: Date.now() + CLEANUP_HOURS * 3600 * 1000,
-    };
+    });
 
-    const doc = await db.collection("posts").add(post);
-    res.json({ success: true, id: doc.id });
+    res.json({ success: true, id: ref.id });
   } catch (e) {
-    console.error(e);
+    console.error("upload:", e);
     res.status(500).json({ error: "upload_failed" });
   }
 });
 
-// People Search
-app.get("/people", async (req, res) => {
+// =============================
+// GET POSTS
+// =============================
+app.get("/posts", async (_, res) => {
   try {
-    const q = (req.query.q || "").toLowerCase();
-    const snap = await db.collection("guests").limit(1000).get();
-    const out = [];
-    snap.forEach((d) => {
-      const g = d.data();
-      if (g.name.toLowerCase().includes(q)) out.push(g);
-    });
-    res.json({ people: out });
-  } catch {
-    res.status(500).json({ error: "search_failed" });
+    const snap = await db.collection("posts").orderBy("createdAt", "desc").limit(100).get();
+    const arr = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.json({ posts: arr });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "posts_failed" });
   }
 });
 
-// List latest posts
-app.get("/posts", async (req, res) => {
+// =============================
+// ADD FRIEND
+// =============================
+app.post("/friend", async (req, res) => {
   try {
-    const snap = await db
-      .collection("posts")
-      .orderBy("createdAt", "desc")
-      .limit(50)
-      .get();
-    const posts = [];
-    snap.forEach((d) => posts.push({ id: d.id, ...d.data() }));
-    res.json({ posts });
-  } catch {
-    res.status(500).json({ error: "read_failed" });
+    const { guestId, friendId } = req.body;
+    if (!guestId || !friendId) return res.status(400).json({ error: "missing_ids" });
+
+    await db.collection("guests")
+      .doc(guestId)
+      .set({ friends: admin.firestore.FieldValue.arrayUnion(friendId) }, { merge: true });
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: "friend_failed" });
   }
 });
 
-// News
+// =============================
+// CLEANUP EXPIRED POSTS
+// =============================
+async function cleanup() {
+  const now = Date.now();
+  const snap = await db.collection("posts").where("expiresAt", "<=", now).get();
+
+  const jobs = snap.docs.map(async d => {
+    const p = d.data();
+    if (p.file?.id) {
+      await drive.files.delete({ fileId: p.file.id }).catch(() => {});
+    }
+    await db.collection("posts").doc(d.id).delete().catch(() => {});
+  });
+
+  await Promise.all(jobs);
+}
+setInterval(cleanup, 3600 * 1000);
+setTimeout(cleanup, 120000);
+
+// =============================
+// NEWS API PROXY
+// =============================
 app.get("/news", async (req, res) => {
   try {
     const q = req.query.q || "India";
-    const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(
-      q
-    )}&mode=ArtList&format=json`;
+    const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(q)}&mode=ArtList&format=json`;
     const r = await axios.get(url);
-    res.json({ articles: r.data.articles || [] });
-  } catch (e) {
+    res.json({ articles: r.data?.articles || [] });
+  } catch {
     res.status(500).json({ error: "news_failed" });
   }
 });
 
-// Auto delete expired posts
-setInterval(async () => {
-  const now = Date.now();
-  const snap = await db.collection("posts").where("expiresAt", "<=", now).get();
-  snap.forEach(async (d) => {
-    const post = d.data();
-    if (post.file?.id) await drive.files.delete({ fileId: post.file.id });
-    await d.ref.delete();
-  });
-}, 3600 * 1000);
-
+// =============================
 app.listen(PORT, () =>
-  console.log(`🔥 DivineNex Server Running on Port ${PORT}`)
+  console.log("🚀 DivineNex backend running on port", PORT)
 );
